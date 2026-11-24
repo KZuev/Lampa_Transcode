@@ -121,11 +121,16 @@
         var video = document.createElement('video');
         var direct = video.canPlayType && video.canPlayType('video/mp4; codecs="avc1.640028, mp4a.40.2"');
 
-        function failed(session) {
+        function failed(session, stage, status) {
             releaseGateway(session);
             if (request !== playbackRequest) return;
             if (lampa.Noty && typeof lampa.Noty.show === 'function') {
-                lampa.Noty.show('Медиашлюз недоступен. Открываю исходное видео.');
+                var reason = status === 401 ? 'Проверьте API-ключ' :
+                    status === 422 ? 'Шлюз отклонил источник' :
+                    status === 429 ? 'Достигнут лимит сессий' :
+                    status === 0 ? 'Нет ответа от шлюза. Проверьте HTTPS и локальную сеть' :
+                    status ? 'HTTP ' + status : 'Ошибка воспроизведения';
+                lampa.Noty.show(stage + ': ' + reason + '. Открываю исходное видео.');
             }
             fallback(original);
         }
@@ -135,14 +140,14 @@
         }, function (status, result) {
             if (status === 401 && credentials === auth) credentials = null;
             if (status !== 201 || !result || !/^[a-f0-9]{32}$/.test(result.id)) {
-                failed();
+                failed(null, 'Создание сессии', status);
                 return;
             }
             var session = { api: api + '/' + result.id, key: auth.key, original: original };
             var prefix = '/stream/' + result.id + '/';
             if (request !== playbackRequest) { releaseGateway(session); return; }
             if (typeof result.stream_url !== 'string' || result.stream_url.indexOf(prefix) !== 0) {
-                failed(session);
+                failed(session, 'Некорректный URL потока');
                 return;
             }
             var stream = gateway + result.stream_url.slice(1);
@@ -156,18 +161,18 @@
                 delete data.ffprobe;
                 delete data.translate;
                 delete data.voiceovers;
-                data.error = function () { if (gatewaySession === session) failed(session); };
+                data.error = function () { if (gatewaySession === session) failed(session, 'Штатный плеер'); };
                 gatewaySession = session;
                 session.timer = window.setInterval(function () {
                     gatewayRequest('PATCH', session.api, session.key);
                 }, 45000);
                 try { fallback(data); }
-                catch (error) { failed(session); }
+                catch (error) { failed(session, 'Запуск штатного плеера'); }
             }
             if (result.mode === 'direct') launch();
             else gatewayRequest('GET', stream, null, null, function (status) {
                 if (status === 200) launch();
-                else failed(session);
+                else failed(session, 'Загрузка HLS', status);
             });
         });
         return true;
