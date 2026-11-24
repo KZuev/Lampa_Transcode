@@ -68,10 +68,20 @@
 
     function saveTimeline(original, seconds, duration) {
         var timeline = original.timeline;
-        if (!timeline || timeline.stop_recording || typeof timeline.handler !== 'function' ||
+        if (!timeline || timeline.stop_recording ||
             !isFinite(seconds) || !isFinite(duration) || duration <= 0 || seconds < 0) return;
-        try { timeline.handler(Math.round(seconds / duration * 100), seconds, duration); }
-        catch (error) {}
+        var percent = Math.round(seconds / duration * 100);
+        var store = window.Lampa.Timeline;
+        try {
+            if (typeof timeline.handler === 'function') timeline.handler(percent, seconds, duration);
+            else if (timeline.hash && store && typeof store.update === 'function') {
+                store.update({ hash: timeline.hash, time: seconds, duration: duration, percent: percent,
+                    profile: timeline.profile, card: timeline.card, season: timeline.season, episode: timeline.episode });
+            }
+        } catch (error) {}
+        timeline.time = seconds;
+        timeline.duration = duration;
+        timeline.percent = percent;
     }
 
     function fallback(original) {
@@ -205,20 +215,24 @@
         var original = session.original;
         var timeline = original.timeline;
         if (session.sample || !timeline || !timeline.hash || timeline.stop_recording) return;
-        var state, position, duration;
+        var state, position, duration, saved, advanced;
         var plexId = original.plexPlaybackSession;
 
         function report(next, heartbeat) {
-            if (state === 'stopped' || position === undefined || (!heartbeat && state === next)) return;
+            if (state === 'stopped' || !advanced || (!heartbeat && state === next)) return;
             var changed = state !== next;
             state = next;
+            if (saved !== position) {
+                saveTimeline(original, position, duration);
+                saved = position;
+            }
             if (changed && typeof lampa.Player.listener.send === 'function') {
-                lampa.Player.listener.send('native_playback', {
+                try { lampa.Player.listener.send('native_playback', {
                     hash: timeline.hash, state: state, percent: position / duration * 100,
                     time: position, duration: duration,
                     season: original.season || original.season_number,
                     episode: original.episode || original.episode_number
-                });
+                }); } catch (error) {}
             }
             if (typeof plexId === 'string' && plexId && typeof window.CustomEvent === 'function') {
                 if (plexSequence.id !== plexId) plexSequence = { id: plexId, next: 0 };
@@ -227,19 +241,23 @@
                     state: state, time: position, duration: duration
                 } }));
             }
-            saveTimeline(original, position, duration);
         }
 
         session.sample = function (current, total, playing) {
             duration = total;
             position = current;
+            if (current > session.offset) advanced = true;
             if (!state && playing) report('playing');
         };
         session.progress = function (next) {
-            if (state) report(next);
+            if (state || next === 'stopped') report(next);
         };
         session.reportTimer = window.setInterval(function () {
             if (state) report(state, true);
+            else if (advanced && saved !== position) {
+                saveTimeline(original, position, duration);
+                saved = position;
+            }
         }, 10000);
     }
 
