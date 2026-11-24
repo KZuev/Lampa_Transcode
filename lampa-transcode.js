@@ -111,10 +111,26 @@
         gatewayRequest('DELETE', session.api, session.key);
     }
 
+    function showPreparation(pending) {
+        var status = document.createElement('div');
+        status.setAttribute('role', 'status');
+        status.style.cssText = 'position:fixed;left:50%;bottom:12%;transform:translateX(-50%);' +
+            'max-width:85%;padding:.65em 1em;border-radius:.55em;background:#202024;color:#fff;' +
+            'z-index:2147483647;text-align:center;pointer-events:none';
+        status.textContent = 'Подготавливаем видео…';
+        pending.notice = status;
+        document.body.appendChild(status);
+    }
+
+    function hidePreparation(pending) {
+        if (pending.notice && pending.notice.parentNode) pending.notice.parentNode.removeChild(pending.notice);
+    }
+
     function cancelPendingGateway() {
         var pending = pendingGateway;
         pendingGateway = null;
         if (!pending) return;
+        hidePreparation(pending);
         if (pending.xhr) pending.xhr.abort();
         releaseGateway(pending.session);
     }
@@ -182,11 +198,13 @@
         var direct = video.canPlayType && video.canPlayType('video/mp4; codecs="avc1.640028, mp4a.40.2"');
         var pending = { url: url, gateway: gateway };
         pendingGateway = pending;
+        showPreparation(pending);
 
         function failed(session, stage, status, detail) {
             releaseGateway(session);
             if (request !== playbackRequest) return;
             if (pendingGateway === pending) pendingGateway = null;
+            hidePreparation(pending);
             if (lampa.Noty && typeof lampa.Noty.show === 'function') {
                 var reason = status === 401 ? 'Проверьте API-ключ' :
                     status === 422 ? 'Шлюз отклонил источник' :
@@ -202,7 +220,7 @@
         }
 
         pending.xhr = gatewayRequest('POST', api, auth.key, {
-            url: url, accepts_h264_aac_mp4: Boolean(direct), renewable_stream: true
+            url: url, accepts_h264_aac_mp4: Boolean(direct), renewable_stream: true, native_audio: true
         }, function (status, result) {
             if (status !== 201 || !result || !/^[a-f0-9]{32}$/.test(result.id)) {
                 failed(null, 'Создание сессии', status, result && result.detail);
@@ -220,6 +238,7 @@
             function launch() {
                 if (request !== playbackRequest) { releaseGateway(session); return; }
                 pendingGateway = null;
+                hidePreparation(pending);
                 var data = {};
                 Object.keys(original).forEach(function (field) { data[field] = original[field]; });
                 var nativeUrl = result.native_stream_url;
@@ -255,10 +274,13 @@
                 catch (error) { failed(session, 'Запуск штатного плеера'); }
             }
             if (result.mode === 'direct') launch();
-            else pending.xhr = gatewayRequest('GET', stream, null, null, function (status) {
-                if (status === 200) launch();
-                else failed(session, 'Загрузка HLS', status);
-            });
+            else {
+                pending.notice.textContent = 'Подготавливаем поток для плеера…';
+                pending.xhr = gatewayRequest('GET', stream, null, null, function (status) {
+                    if (status === 200) launch();
+                    else failed(session, 'Загрузка HLS', status);
+                });
+            }
         });
         return true;
     }
