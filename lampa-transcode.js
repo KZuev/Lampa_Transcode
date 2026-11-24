@@ -121,6 +121,8 @@
         if (session.progress) session.progress('stopped');
         if (session.timer) window.clearInterval(session.timer);
         if (session.reportTimer) window.clearInterval(session.reportTimer);
+        if (session.seekPoll) window.clearTimeout(session.seekPoll);
+        if (session.seekNotice) hidePreparation(session.seekNotice);
         clearStartup(session);
         clearPlaybackPrompt(session);
         if (gatewaySession === session) gatewaySession = null;
@@ -195,6 +197,7 @@
         if (!panel || typeof panel.update !== 'function' || !utils || !lampa.Lang) return;
         panel.update('time', utils.secondsToTime(Math.floor(current), true));
         panel.update('timenow', utils.secondsToTime(current));
+        panel.update('position', (current / duration * 100) + '%');
         panel.update('timeend', utils.secondsToTime(duration) + ' - ' + lampa.Lang.translate('title_left') +
             ' ' + utils.secondsToTimeHuman(Math.max(0, duration - current)));
     }
@@ -423,6 +426,27 @@
             var prefix = '/stream/' + result.id + '/';
             if (request !== playbackRequest) { releaseGateway(session); return; }
             var stream;
+            function nativeSource(description, mediaUrl) {
+                var master = description.native_stream_url;
+                return typeof master === 'string' && master.indexOf(prefix + 'native.m3u8?') === 0
+                    ? gateway + master.slice(1) : mediaUrl;
+            }
+
+            function waitForHls(mediaUrl, alive, schedule, complete) {
+                var deadline = new Date().getTime() + 45000;
+                function read() {
+                    if (!alive()) return;
+                    return gatewayRequest('GET', mediaUrl, null, null, function (status, manifest) {
+                        if (!alive()) return;
+                        var count = status === 200 && (String(manifest).match(/^#EXTINF:/gm) || []).length;
+                        if (count >= 3 || (count && /^#EXT-X-ENDLIST\s*$/m.test(manifest))) complete(true);
+                        else if ((status === 200 || status === 503) && new Date().getTime() < deadline) {
+                            schedule(window.setTimeout(read, 1000));
+                        } else complete(false, status);
+                    });
+                }
+                return read();
+            }
             var trackedHls = result.mode !== 'direct' && lampa.PlayerVideo && lampa.PlayerVideo.listener &&
                 original.timeline && original.timeline.hash && !original.timeline.stop_recording && result.duration > 0;
             function launch() {
@@ -431,9 +455,7 @@
                 hidePreparation(pending);
                 var data = {};
                 Object.keys(original).forEach(function (field) { data[field] = original[field]; });
-                var nativeUrl = result.native_stream_url;
-                data.url = typeof nativeUrl === 'string' && nativeUrl.indexOf(prefix + 'native.m3u8?') === 0
-                    ? gateway + nativeUrl.slice(1) : stream;
+                data.url = nativeSource(result, stream);
                 if (result.mode !== 'direct') {
                     data.hls_manifest_timeout = 30000;
                     var apple = /iPhone|iPad|iPod|Macintosh/.test(window.navigator && window.navigator.userAgent || '');
@@ -486,7 +508,7 @@
                 delete data.translate;
                 delete data.voiceovers;
                 data.error = function () {
-                    if (gatewaySession !== session || session.released) return;
+                    if (gatewaySession !== session || session.released || session.seekNotice) return;
                     var media = lampa.PlayerVideo && typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
                     var code = media && media.error && Number(media.error.code);
                     var reasons = { 1: 'Воспроизведение прервано', 2: 'Видео перестало загружаться',
@@ -498,6 +520,45 @@
                 session.duration = result.duration;
                 session.offset = Number(result.offset) || 0;
                 session.trackPlayback = !session.hls || trackedHls;
+                var playerVideo = lampa.PlayerVideo;
+                if (session.hls && session.duration > 0 && playerVideo &&
+                    typeof playerVideo.url === 'function' && typeof playerVideo.destroy === 'function') {
+                    session.seek = function (fraction) {
+                        if (session.seekNotice || !isFinite(fraction)) return;
+                        var seconds = Math.max(0, Math.min(session.duration - 0.1, fraction * session.duration));
+                        session.seekNotice = {};
+                        showPreparation(session.seekNotice);
+                        session.seekNotice.notice.textContent = 'Перематываем видео…';
+                        clearStartup(session);
+                        function alive() { return gatewaySession === session && !session.released; }
+                        gatewayRequest('POST', session.api + '/seek', session.key, { seconds: seconds }, function (status, shifted) {
+                            if (!alive()) return;
+                            if (status !== 200 || !shifted || typeof shifted.stream_url !== 'string' || shifted.stream_url.indexOf(prefix) !== 0) {
+                                failed(session, 'Перемотка', status);
+                                return;
+                            }
+                            var mediaUrl = gateway + shifted.stream_url.slice(1);
+                            waitForHls(mediaUrl, alive, function (timer) { session.seekPoll = timer; }, function (ready, errorStatus) {
+                                if (!ready) { failed(session, 'Загрузка после перемотки', errorStatus); return; }
+                                var nextUrl = nativeSource(shifted, mediaUrl);
+                                if (data.playlist) data.playlist.forEach(function (item) {
+                                    if (item && item.url === data.url) item.url = nextUrl;
+                                });
+                                data.url = nextUrl;
+                                data.transcodeSource.stream = nextUrl;
+                                session.offset = Number(shifted.offset) || 0;
+                                session.clockStart = undefined;
+                                session.audioRestored = session.playTried = session.expired = false;
+                                playerVideo.destroy(true);
+                                playerVideo.url(nextUrl, true);
+                                hidePreparation(session.seekNotice);
+                                session.seekNotice = null;
+                                updateStockClock(lampa, session.offset, session.duration);
+                                armStartup(session);
+                            });
+                        });
+                    };
+                }
                 gatewaySession = session;
                 session.timer = window.setInterval(function () {
                     gatewayRequest('PATCH', session.api, session.key);
@@ -514,20 +575,13 @@
                 if (result.mode === 'direct') launch();
                 else {
                     pending.notice.textContent = 'Подготавливаем поток для плеера…';
-                    var deadline = new Date().getTime() + 45000;
-                    function waitForBuffer() {
-                        if (request !== playbackRequest || pendingGateway !== pending) return;
-                        pending.xhr = gatewayRequest('GET', stream, null, null, function (status, manifest) {
-                            if (request !== playbackRequest || pendingGateway !== pending) return;
-                            var count = status === 200 && (String(manifest).match(/^#EXTINF:/gm) || []).length;
-                            if (count >= 3 || (count && /^#EXT-X-ENDLIST\s*$/m.test(manifest))) launch();
-                            else if ((status === 200 || status === 503) && new Date().getTime() < deadline) {
-                                pending.poll = window.setTimeout(waitForBuffer, 1000);
-                            } else failed(session, 'Загрузка HLS', status === 200 ? null : status,
-                                'Не удалось собрать начальный буфер');
-                        });
-                    }
-                    waitForBuffer();
+                    pending.xhr = waitForHls(stream, function () {
+                        return request === playbackRequest && pendingGateway === pending;
+                    }, function (timer) { pending.poll = timer; }, function (ready, status) {
+                        if (ready) launch();
+                        else failed(session, 'Загрузка HLS', status === 200 ? null : status,
+                            'Не удалось собрать начальный буфер');
+                    });
                 }
             }
             var resume = trackedHls ? savedPosition(original) : 0;
@@ -766,6 +820,13 @@
             field: { name: 'Использовать экспериментальный плеер' }
         });
         if (lampa.PlayerVideo && lampa.PlayerVideo.listener) {
+            if (lampa.PlayerPanel && lampa.PlayerPanel.listener) {
+                lampa.PlayerPanel.listener.follow('mouse_rewind', function (event) {
+                    var session = gatewaySession;
+                    if (!session || !session.stockReady || !session.seek) return;
+                    if (event.method === 'click') session.seek(event.percent);
+                });
+            }
             lampa.PlayerVideo.listener.follow('tracks', function (event) {
                 if (gatewaySession) rememberStockAudio(gatewaySession, event.tracks);
             });
@@ -791,7 +852,7 @@
                     clearStartup(gatewaySession);
                     clearPlaybackPrompt(gatewaySession);
                 }
-                if (gatewaySession && gatewaySession.stockReady) stockTimeUpdate(gatewaySession, lampa, event);
+                if (gatewaySession && gatewaySession.stockReady && !gatewaySession.seekNotice) stockTimeUpdate(gatewaySession, lampa, event);
             });
             lampa.PlayerVideo.listener.follow('play', function () {
                 if (gatewaySession) {
