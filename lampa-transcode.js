@@ -143,6 +143,15 @@
         }, 60000);
     }
 
+    function readyStockGateway(session, lampa) {
+        session.stockReady = true;
+        if (session.hls && isFinite(session.duration) && session.duration > 0) {
+            updateStockClock(lampa, session.offset, session.duration);
+        }
+        if (session.trackPlayback) trackPlayback(session, lampa);
+        armStartup(session);
+    }
+
     function tryStockPlay(session, media) {
         if (!session.startup || session.playTried || !media || !media.paused || typeof media.play !== 'function') return;
         session.playTried = true;
@@ -311,6 +320,10 @@
         var pending = pendingGateway;
         pendingGateway = null;
         if (!pending) return;
+        if (pending.warmMedia) {
+            pending.warmMedia.loop = false;
+            pending.warmMedia.pause();
+        }
         hidePreparation(pending);
         if (pending.poll) window.clearTimeout(pending.poll);
         if (pending.xhr) pending.xhr.abort();
@@ -379,14 +392,35 @@
         var video = document.createElement('video');
         var direct = video.canPlayType && video.canPlayType('video/mp4; codecs="avc1.640028, mp4a.40.2"');
         var pending = { url: url, gateway: gateway };
+        var browser = window.navigator || {};
+        var apple = /iPhone|iPad|iPod|Macintosh/.test(browser.userAgent || '');
+        var nativeHls = apple && video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl');
         pendingGateway = pending;
         showPreparation(pending);
+
+        if (nativeHls && browser.userActivation && browser.userActivation.isActive &&
+            lampa.PlayerVideo && typeof lampa.PlayerVideo.video === 'function' && typeof window.btoa === 'function') {
+            // Keep the gesture on the stock media element while the gateway prepares the real source.
+            var silence = 'RIFFd\x1f\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00@\x1f\x00\x00@\x1f\x00\x00\x01\x00\x08\x00data@\x1f\x00\x00';
+            pending.warmData = {
+                url: 'data:audio/wav;base64,' + window.btoa(silence + new Array(8001).join('\x80')),
+                launch_player: 'inner', title: original.title, card: original.card, season: original.season,
+                episode: original.episode, plexPlaybackSession: original.plexPlaybackSession,
+                timeline: original.timeline && { hash: original.timeline.hash, stop_recording: true }
+            };
+            try { fallback(pending.warmData); }
+            catch (error) { pending.warmData = null; }
+        }
 
         function failed(session, stage, status, detail) {
             releaseGateway(session);
             if (request !== playbackRequest) return;
             if (pendingGateway === pending) pendingGateway = null;
             hidePreparation(pending);
+            if (pending.warmMedia && typeof lampa.Player.close === 'function') {
+                pending.warmMedia.loop = false;
+                lampa.Player.close();
+            }
             if (lampa.Noty && typeof lampa.Noty.show === 'function') {
                 var reason = status === 401 ? 'Проверьте API-ключ' :
                     status === 422 ? 'Шлюз отклонил источник' :
@@ -438,16 +472,20 @@
                 original.timeline && original.timeline.hash && !original.timeline.stop_recording && result.duration > 0;
             function launch() {
                 if (request !== playbackRequest) { releaseGateway(session); return; }
+                if (pending.warmData && !pending.warmReady) {
+                    pending.onWarmReady = launch;
+                    return;
+                }
                 pendingGateway = null;
                 hidePreparation(pending);
-                var data = {};
+                var warmMedia = pending.warmMedia;
+                var reuse = warmMedia && warmMedia === lampa.PlayerVideo.video() && typeof warmMedia.load === 'function';
+                var data = reuse ? pending.warmData : {};
                 Object.keys(original).forEach(function (field) { data[field] = original[field]; });
                 data.url = nativeSource(result, stream);
                 if (result.mode !== 'direct') {
                     data.hls_manifest_timeout = 30000;
-                    var apple = /iPhone|iPad|iPod|Macintosh/.test(window.navigator && window.navigator.userAgent || '');
-                    if ((window.location && window.location.protocol === 'lampaapp:') ||
-                        (apple && video.canPlayType && video.canPlayType('application/vnd.apple.mpegurl'))) {
+                    if ((window.location && window.location.protocol === 'lampaapp:') || nativeHls) {
                         data.hls_type = 'native';
                     }
                 }
@@ -576,7 +614,16 @@
                 session.timer = window.setInterval(function () {
                     gatewayRequest('PATCH', session.api, session.key);
                 }, 45000);
-                try { fallback(data); }
+                try {
+                    if (reuse) {
+                        pending.warmMedia = null;
+                        if (data.playlist && typeof lampa.Player.playlist === 'function') lampa.Player.playlist(data.playlist);
+                        readyStockGateway(session, lampa);
+                        warmMedia.loop = false;
+                        warmMedia.src = data.url;
+                        warmMedia.load();
+                    } else fallback(data);
+                }
                 catch (error) { failed(session, 'Запуск штатного плеера'); }
             }
             function prepare() {
@@ -844,15 +891,20 @@
                 if (gatewaySession) rememberStockAudio(gatewaySession, event.tracks);
             });
             lampa.Player.listener.follow('ready', function (data) {
+                var media = typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
+                if (pendingGateway && pendingGateway.warmData === data) {
+                    var waiting = pendingGateway;
+                    waiting.warmReady = true;
+                    if (media) {
+                        media.loop = true;
+                        waiting.warmMedia = media;
+                    }
+                    if (waiting.onWarmReady) waiting.onWarmReady();
+                    return;
+                }
                 var session = gatewaySession;
                 if (!session || session.playData !== data) return;
-                session.stockReady = true;
-                if (session.hls && isFinite(session.duration) && session.duration > 0) {
-                    updateStockClock(lampa, session.offset, session.duration);
-                }
-                if (session.trackPlayback) trackPlayback(session, lampa);
-                armStartup(session);
-                var media = typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
+                readyStockGateway(session, lampa);
                 if (media && media.readyState >= 3) tryStockPlay(session, media);
             });
             lampa.PlayerVideo.listener.follow('canplay', function () {
@@ -880,7 +932,13 @@
                 if (!event.savemeta && gatewaySession && gatewaySession.progress) gatewaySession.progress('stopped');
             });
         }
-        lampa.Player.listener.follow('destroy', function () { releaseGateway(gatewaySession); });
+        lampa.Player.listener.follow('destroy', function () {
+            if (pendingGateway && pendingGateway.warmMedia) {
+                playbackRequest++;
+                cancelPendingGateway();
+            }
+            releaseGateway(gatewaySession);
+        });
         controller.add(name, {
             back: function () { close(true); },
             left: function () { jump(-10); },
