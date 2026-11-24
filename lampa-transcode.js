@@ -11,6 +11,7 @@
     var pendingGateway;
     var playbackRequest = 0;
     var plexSequence = { id: null, next: 0 };
+    var stockPlaylist;
     var credentials;
     var script = document.currentScript;
     var configuredGateway = window.LAMPA_TRANSCODE_CONFIG && window.LAMPA_TRANSCODE_CONFIG.gateway;
@@ -211,6 +212,57 @@
         if (session.sample) session.sample(current, duration, event.current > session.clockStart && (!media || !media.paused));
     }
 
+    function seriesAudioKey(data) {
+        if (data.transcodeSeries) return data.transcodeSeries;
+        var timeline = data.timeline || {};
+        if (typeof timeline.card === 'string' && /^tv_/.test(timeline.card)) return timeline.card;
+        var card = data.card || {};
+        if (card.id && (card.media_type === 'tv' || card.original_name || data.episode)) return 'tv_' + card.id;
+        if (data.plexPlaybackSession && Array.isArray(data.playlist) && data.playlist.length > 1 &&
+            typeof card.title === 'string' && card.title.indexOf(' - ') > 0) {
+            return 'plex_' + card.title.split(' - ')[0];
+        }
+    }
+
+    function rememberStockAudio(session, tracks) {
+        var timeline = session.original.timeline;
+        var series = seriesAudioKey(session.original);
+        var hash = timeline && timeline.hash;
+        if ((!series && !hash) || !tracks || tracks.length < 2) return;
+        var key = name + '_audio_' + (series ? 'series_' + series : hash);
+        var choice;
+        try { choice = JSON.parse(window.localStorage.getItem(key)); } catch (error) {}
+        var matches = [];
+        Array.prototype.forEach.call(tracks, function (track, index) {
+            var identity = {
+                label: String(track.label || track.name || '').replace(/^\d+\.\s*/, ''),
+                language: String(track.language || track.lang || ''),
+                index: index
+            };
+            if (choice && choice.label === identity.label && choice.language === identity.language) matches.push(index);
+            var previous = track.onSelect;
+            if (previous && previous.transcodeAudioSession === session) return;
+            var selected = function () {
+                try { window.localStorage.setItem(key, JSON.stringify(identity)); } catch (error) {}
+                if (typeof previous === 'function') return previous.apply(this, arguments);
+            };
+            selected.transcodeAudioSession = session;
+            track.onSelect = selected;
+        });
+        if (!choice || session.audioRestored) return;
+        var index = matches.indexOf(choice.index) !== -1 ? choice.index : matches.length === 1 ? matches[0] : -1;
+        if (index < 0) return;
+        session.audioRestored = true;
+        Array.prototype.forEach.call(tracks, function (track, i) {
+            if (i !== index) {
+                track.enabled = false;
+                track.selected = false;
+            }
+        });
+        tracks[index].enabled = true;
+        tracks[index].selected = true;
+    }
+
     function trackPlayback(session, lampa) {
         var original = session.original;
         var timeline = original.timeline;
@@ -401,13 +453,22 @@
                     data.timeline.duration = 0;
                 }
                 data.transcodeSource = { url: url, stream: data.url };
-                if (Array.isArray(data.playlist)) {
-                    data.playlist = data.playlist.map(function (entry) {
+                var list = Array.isArray(data.playlist) ? data.playlist :
+                    stockPlaylist && data.transcodeList === stockPlaylist.id ? stockPlaylist.items : null;
+                if (list) {
+                    var listId = request;
+                    var series = seriesAudioKey(data);
+                    data.playlist = list.map(function (entry) {
                         if (!entry) return entry;
-                        var current = entry.url === original.url || entry.url === url;
-                        if (!current && !data.plexPlaybackSession) return entry;
                         var item = {};
                         Object.keys(entry).forEach(function (field) { item[field] = entry[field]; });
+                        if (item.transcodeSource && item.url === item.transcodeSource.stream) {
+                            item.url = item.transcodeSource.url;
+                            delete item.transcodeSource;
+                        }
+                        var current = item.url === original.url || item.url === url || entry.url === original.url;
+                        item.transcodeList = listId;
+                        if (series) item.transcodeSeries = series;
                         if (data.plexPlaybackSession) item.plexPlaybackSession = data.plexPlaybackSession;
                         if (current) {
                             item.url = data.url;
@@ -415,6 +476,7 @@
                         }
                         return item;
                     });
+                    stockPlaylist = { id: listId, items: data.playlist };
                 }
                 delete data.torrent_hash;
                 delete data.torrent_index;
@@ -704,6 +766,9 @@
             field: { name: 'Использовать экспериментальный плеер' }
         });
         if (lampa.PlayerVideo && lampa.PlayerVideo.listener) {
+            lampa.PlayerVideo.listener.follow('tracks', function (event) {
+                if (gatewaySession) rememberStockAudio(gatewaySession, event.tracks);
+            });
             lampa.Player.listener.follow('ready', function (data) {
                 var session = gatewaySession;
                 if (!session || session.playData !== data) return;
