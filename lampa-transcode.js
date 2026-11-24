@@ -255,7 +255,13 @@
             !lampa.Player || !lampa.Player.listener || !lampa.Storage) return;
         installed = true;
         controller = lampa.Controller;
-        lampa.SettingsApi.addComponent({ component: name, name: 'Lampa Transcode' });
+        lampa.SettingsApi.addComponent({
+            component: name,
+            name: 'Lampa Transcode',
+            icon: '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" aria-hidden="true">' +
+                '<rect x="2.5" y="4.5" width="19" height="15" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/>' +
+                '<path d="M10 8.5l5.5 3.5-5.5 3.5z" fill="currentColor"/></svg>'
+        });
         lampa.SettingsApi.addParam({
             component: name,
             param: { name: name + '_enabled', type: 'trigger', default: false },
