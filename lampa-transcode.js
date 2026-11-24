@@ -130,18 +130,32 @@
             notify('Сначала укажите адрес медиашлюза.');
             return;
         }
-        var value = window.prompt('Введите API-ключ медиашлюза. Чтобы удалить ключ, оставьте поле пустым.', '');
-        if (value === null) return;
-        var key = value.trim();
-        credentials = key ? { gateway: gateway, key: key } : null;
-        var saved = false;
+        var input = window.Lampa.Input;
+        if (!input || typeof input.edit !== 'function') {
+            notify('В этой сборке Lampa недоступен редактор настроек.');
+            return;
+        }
+        input.edit({ title: 'API-ключ медиашлюза', value: '', password: true, nosave: true, nomic: true }, function (value) {
+            var key = String(value || '').trim();
+            if (!key || gatewayAddress() !== gateway) return;
+            credentials = { gateway: gateway, key: key };
+            try {
+                window.localStorage.setItem(name + '_credentials', JSON.stringify(credentials));
+                notify('API-ключ сохранён.');
+            } catch (error) {
+                notify('API-ключ действует до закрытия Lampa.');
+            }
+        });
+    }
+
+    function removeKey() {
+        var gateway = gatewayAddress();
+        if (!gateway || !gatewayCredentials(gateway)) return;
+        credentials = null;
         try {
-            if (credentials) window.localStorage.setItem(name + '_credentials', JSON.stringify(credentials));
-            else window.localStorage.removeItem(name + '_credentials');
-            saved = true;
+            window.localStorage.removeItem(name + '_credentials');
         } catch (error) {}
-        if (key) notify(saved ? 'API-ключ сохранён.' : 'API-ключ действует до закрытия Lampa.');
-        else notify('API-ключ удалён.');
+        notify('API-ключ удалён.');
     }
 
     function nativeGateway(url, original, gateway, request) {
@@ -413,8 +427,14 @@
         lampa.SettingsApi.addParam({
             component: name,
             param: { name: name + '_set_key', type: 'button' },
-            field: { name: 'API-ключ медиашлюза', description: 'Ввести, заменить или удалить ключ' },
+            field: { name: 'API-ключ медиашлюза', description: 'Ввести или заменить ключ' },
             onChange: configureKey
+        });
+        lampa.SettingsApi.addParam({
+            component: name,
+            param: { name: name + '_remove_key', type: 'button' },
+            field: { name: 'Удалить API-ключ' },
+            onChange: removeKey
         });
         lampa.SettingsApi.addParam({
             component: name,
