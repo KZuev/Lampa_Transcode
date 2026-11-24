@@ -263,7 +263,7 @@
         });
         lampa.SettingsApi.addParam({
             component: name,
-            param: { name: name + '_gateway_url', type: 'input', default: '', placeholder: 'https://nas.example.org' },
+            param: { name: name + '_gateway_url', type: 'input', values: '', default: '', placeholder: 'https://nas.example.org' },
             field: { name: 'Адрес медиашлюза' },
             onChange: function (value) { lampa.Storage.set(name + '_gateway_url', String(value || '').trim()); }
         });
