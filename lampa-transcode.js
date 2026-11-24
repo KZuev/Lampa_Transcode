@@ -106,6 +106,7 @@
         if (!session || session.released) return;
         session.released = true;
         if (session.timer) window.clearInterval(session.timer);
+        if (session.startup) window.clearTimeout(session.startup);
         if (gatewaySession === session) gatewaySession = null;
         gatewayRequest('DELETE', session.api, session.key);
     }
@@ -221,13 +222,31 @@
                 pendingGateway = null;
                 var data = {};
                 Object.keys(original).forEach(function (field) { data[field] = original[field]; });
-                data.url = stream;
+                var nativeUrl = result.native_stream_url;
+                data.url = typeof nativeUrl === 'string' && nativeUrl.indexOf(prefix + 'native.m3u8?') === 0
+                    ? gateway + nativeUrl.slice(1) : stream;
+                if (result.mode !== 'direct') {
+                    data.hls_manifest_timeout = 30000;
+                    if (window.location && window.location.protocol === 'lampaapp:') data.hls_type = 'native';
+                }
+                if (Array.isArray(data.playlist)) {
+                    data.playlist = data.playlist.map(function (entry) {
+                        if (!entry || (entry.url !== original.url && entry.url !== url)) return entry;
+                        var item = {};
+                        Object.keys(entry).forEach(function (field) { item[field] = entry[field]; });
+                        item.url = data.url;
+                        return item;
+                    });
+                }
+                delete data.torrent_hash;
+                delete data.torrent_index;
                 delete data.quality;
                 delete data.url_reserve;
                 delete data.ffprobe;
                 delete data.translate;
                 delete data.voiceovers;
                 data.error = function () { if (gatewaySession === session) failed(session, 'Штатный плеер'); };
+                session.playData = data;
                 gatewaySession = session;
                 session.timer = window.setInterval(function () {
                     gatewayRequest('PATCH', session.api, session.key);
@@ -464,6 +483,21 @@
             param: { name: name + '_custom', type: 'trigger', default: false },
             field: { name: 'Использовать экспериментальный плеер' }
         });
+        if (lampa.PlayerVideo && lampa.PlayerVideo.listener) {
+            lampa.Player.listener.follow('ready', function (data) {
+                var session = gatewaySession;
+                if (!session || session.playData !== data) return;
+                session.startup = window.setTimeout(function () {
+                    if (gatewaySession === session) data.error();
+                }, 35000);
+            });
+            lampa.PlayerVideo.listener.follow('timeupdate', function (event) {
+                if (gatewaySession && gatewaySession.startup && event.current > 0) {
+                    window.clearTimeout(gatewaySession.startup);
+                    gatewaySession.startup = null;
+                }
+            });
+        }
         lampa.Player.listener.follow('destroy', function () { releaseGateway(gatewaySession); });
         controller.add(name, {
             back: function () { close(true); },
