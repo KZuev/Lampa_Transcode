@@ -111,6 +111,7 @@
         if (session.timer) window.clearInterval(session.timer);
         if (session.reportTimer) window.clearInterval(session.reportTimer);
         clearStartup(session);
+        clearPlaybackPrompt(session);
         if (gatewaySession === session) gatewaySession = null;
         gatewayRequest('DELETE', session.api, session.key);
     }
@@ -118,6 +119,51 @@
     function clearStartup(session) {
         if (session.startup) window.clearTimeout(session.startup);
         session.startup = null;
+    }
+
+    function clearPlaybackPrompt(session) {
+        if (session.playPrompt && session.playPrompt.parentNode) session.playPrompt.parentNode.removeChild(session.playPrompt);
+        session.playPrompt = null;
+    }
+
+    function armStartup(session) {
+        clearStartup(session);
+        session.startup = window.setTimeout(function () {
+            if (gatewaySession === session) {
+                session.expired = true;
+                session.playData.error();
+            }
+        }, 60000);
+    }
+
+    function tryStockPlay(session, media) {
+        if (!session.startup || session.playTried || !media || !media.paused || typeof media.play !== 'function') return;
+        session.playTried = true;
+        var attempt;
+        try { attempt = media.play(); }
+        catch (error) { return; }
+        if (!attempt || typeof attempt.then !== 'function') return;
+        attempt.then(function () {
+            if (gatewaySession === session) clearStartup(session);
+        }, function (error) {
+            if (gatewaySession !== session || !session.startup || !error || error.name !== 'NotAllowedError') return;
+            clearStartup(session);
+            var button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = '▶ Воспроизвести';
+            button.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
+                'z-index:2147483647;padding:.8em 1.2em;border:0;border-radius:.5em;background:#202024;color:#fff;' +
+                'font-size:1.4rem;font-weight:700;white-space:nowrap;cursor:pointer';
+            session.playPrompt = button;
+            button.onclick = function () {
+                clearPlaybackPrompt(session);
+                if (gatewaySession !== session) return;
+                armStartup(session);
+                session.playTried = false;
+                tryStockPlay(session, media);
+            };
+            document.body.appendChild(button);
+        });
     }
 
     function showPreparation(pending) {
@@ -629,22 +675,27 @@
                 var session = gatewaySession;
                 if (!session || session.playData !== data) return;
                 if (session.trackPlayback) trackPlayback(session, lampa);
-                clearStartup(session);
-                session.startup = window.setTimeout(function () {
-                    if (gatewaySession === session) {
-                        session.expired = true;
-                        data.error();
-                    }
-                }, 60000);
+                armStartup(session);
+                var media = typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
+                if (media && media.readyState >= 3) tryStockPlay(session, media);
+            });
+            lampa.PlayerVideo.listener.follow('canplay', function () {
+                if (gatewaySession && typeof lampa.PlayerVideo.video === 'function') {
+                    tryStockPlay(gatewaySession, lampa.PlayerVideo.video());
+                }
             });
             lampa.PlayerVideo.listener.follow('timeupdate', function (event) {
-                if (gatewaySession && gatewaySession.startup && event.current > 0) {
+                if (gatewaySession && event.current > 0 && (gatewaySession.startup || gatewaySession.playPrompt)) {
                     clearStartup(gatewaySession);
+                    clearPlaybackPrompt(gatewaySession);
                 }
                 if (gatewaySession && gatewaySession.sample) gatewaySession.sample(event);
             });
             lampa.PlayerVideo.listener.follow('play', function () {
-                if (gatewaySession && gatewaySession.startup) clearStartup(gatewaySession);
+                if (gatewaySession) {
+                    clearStartup(gatewaySession);
+                    clearPlaybackPrompt(gatewaySession);
+                }
                 if (gatewaySession && gatewaySession.progress) gatewaySession.progress('playing');
             });
             lampa.PlayerVideo.listener.follow('pause', function () {
