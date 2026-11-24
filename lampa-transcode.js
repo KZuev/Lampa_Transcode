@@ -170,7 +170,7 @@
         var video = document.createElement('video');
         var direct = video.canPlayType && video.canPlayType('video/mp4; codecs="avc1.640028, mp4a.40.2"');
 
-        function failed(session, stage, status) {
+        function failed(session, stage, status, detail) {
             releaseGateway(session);
             if (request !== playbackRequest) return;
             if (lampa.Noty && typeof lampa.Noty.show === 'function') {
@@ -179,6 +179,9 @@
                     status === 429 ? 'Достигнут лимит сессий' :
                     status === 0 ? 'Нет ответа от шлюза. Проверьте HTTPS и локальную сеть' :
                     status ? 'HTTP ' + status : 'Ошибка воспроизведения';
+                if (status === 422 && typeof detail === 'string' && /^[А-Яа-яЁёA-Za-z0-9 .,:()-]{1,160}$/.test(detail)) {
+                    reason = detail.replace(/\.$/, '');
+                }
                 lampa.Noty.show(stage + ': ' + reason + '. Открываю исходное видео.');
             }
             fallback(original);
@@ -188,7 +191,7 @@
             url: url, accepts_h264_aac_mp4: Boolean(direct), renewable_stream: true
         }, function (status, result) {
             if (status !== 201 || !result || !/^[a-f0-9]{32}$/.test(result.id)) {
-                failed(null, 'Создание сессии', status);
+                failed(null, 'Создание сессии', status, result && result.detail);
                 return;
             }
             var session = { api: api + '/' + result.id, key: auth.key, original: original };
