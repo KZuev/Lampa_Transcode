@@ -178,12 +178,34 @@
         document.body.appendChild(status);
     }
 
+    function updateStockClock(lampa, current, duration) {
+        var panel = lampa.PlayerPanel;
+        var utils = lampa.Utils;
+        if (!panel || typeof panel.update !== 'function' || !utils || !lampa.Lang) return;
+        panel.update('time', utils.secondsToTime(Math.floor(current), true));
+        panel.update('timenow', utils.secondsToTime(current));
+        panel.update('timeend', utils.secondsToTime(duration) + ' - ' + lampa.Lang.translate('title_left') +
+            ' ' + utils.secondsToTimeHuman(Math.max(0, duration - current)));
+    }
+
+    function stockTimeUpdate(session, lampa, event) {
+        var media = typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
+        var duration = Number(session.hls ? session.duration : event.duration);
+        if (typeof event.current !== 'number' || !isFinite(event.current) ||
+            !isFinite(duration) || duration <= 0 || (media && media.seeking)) return;
+        if (session.clockStart === undefined) {
+            session.clockStart = session.hls && media && media.seekable && media.seekable.length ? media.seekable.start(0) : 0;
+        }
+        var current = Math.min(duration, session.offset + Math.max(0, event.current - session.clockStart));
+        if (session.hls) updateStockClock(lampa, current, duration);
+        if (session.sample) session.sample(current, duration, event.current > session.clockStart && (!media || !media.paused));
+    }
+
     function trackPlayback(session, lampa) {
         var original = session.original;
         var timeline = original.timeline;
         if (session.sample || !timeline || !timeline.hash || timeline.stop_recording) return;
-        var state, position, duration, start;
-        var video = lampa.PlayerVideo;
+        var state, position, duration;
         var plexId = original.plexPlaybackSession;
 
         function report(next, heartbeat) {
@@ -208,17 +230,10 @@
             saveTimeline(original, position, duration);
         }
 
-        session.sample = function (event) {
-            var media = typeof video.video === 'function' && video.video();
-            var total = Number(session.hls ? session.duration : event.duration);
-            if (typeof event.current !== 'number' || !isFinite(event.current) ||
-                !isFinite(total) || total <= 0 || (media && media.seeking)) return;
-            if (start === undefined) {
-                start = session.hls && media && media.seekable && media.seekable.length ? media.seekable.start(0) : 0;
-            }
+        session.sample = function (current, total, playing) {
             duration = total;
-            position = Math.min(total, session.offset + Math.max(0, event.current - start));
-            if (!state && event.current > start && (!media || !media.paused)) report('playing');
+            position = current;
+            if (!state && playing) report('playing');
         };
         session.progress = function (next) {
             if (state) report(next);
@@ -674,6 +689,10 @@
             lampa.Player.listener.follow('ready', function (data) {
                 var session = gatewaySession;
                 if (!session || session.playData !== data) return;
+                session.stockReady = true;
+                if (session.hls && isFinite(session.duration) && session.duration > 0) {
+                    updateStockClock(lampa, session.offset, session.duration);
+                }
                 if (session.trackPlayback) trackPlayback(session, lampa);
                 armStartup(session);
                 var media = typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
@@ -689,7 +708,7 @@
                     clearStartup(gatewaySession);
                     clearPlaybackPrompt(gatewaySession);
                 }
-                if (gatewaySession && gatewaySession.sample) gatewaySession.sample(event);
+                if (gatewaySession && gatewaySession.stockReady) stockTimeUpdate(gatewaySession, lampa, event);
             });
             lampa.PlayerVideo.listener.follow('play', function () {
                 if (gatewaySession) {
