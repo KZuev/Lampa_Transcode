@@ -7,6 +7,9 @@
     var installed = false;
     var controller;
     var hlsScript;
+    var gatewaySession;
+    var playbackRequest = 0;
+    var credentials;
     var script = document.currentScript;
     var configuredGateway = window.LAMPA_TRANSCODE_CONFIG && window.LAMPA_TRANSCODE_CONFIG.gateway;
     var detectedGateway = script && /\/plugin\.js(?:[?#]|$)/i.test(script.src) ?
@@ -17,7 +20,7 @@
         var saved = typeof storage.get === 'function' ? storage.get(name + '_gateway_url', '') : '';
         var address = String(saved || configuredGateway || detectedGateway || '').trim();
         if (!/^https?:\/\/(?:[a-z0-9.-]+|\[[a-f0-9:]+\])(?::[0-9]+)?(?:\/[^\s?#\\@]*)?$/i.test(address)) return '';
-        if (window.location && window.location.protocol === 'https:' && !/^https:/i.test(address)) return '';
+        if (window.location && /^(https|lampaapp):$/.test(window.location.protocol) && !/^https:/i.test(address)) return '';
         return address.replace(/\/*$/, '/');
     }
 
@@ -73,6 +76,101 @@
         bypass = true;
         try { window.Lampa.Player.play(original); }
         finally { bypass = false; }
+    }
+
+    function gatewayRequest(method, url, key, data, callback) {
+        var xhr = new window.XMLHttpRequest();
+        var finish = callback || function () {};
+        try {
+            xhr.open(method, url);
+            xhr.timeout = 45000;
+            if (key) xhr.setRequestHeader('Authorization', 'Bearer ' + key);
+            if (data) xhr.setRequestHeader('Content-Type', 'application/json');
+            xhr.onload = function () {
+                var result;
+                if (key) {
+                    try { result = JSON.parse(xhr.responseText); } catch (error) {}
+                }
+                finish(xhr.status, result);
+            };
+            xhr.ontimeout = xhr.onerror = function () { finish(0); };
+            xhr.send(data ? JSON.stringify(data) : null);
+        } catch (error) {
+            finish(0);
+        }
+    }
+
+    function releaseGateway(session) {
+        if (!session || session.released) return;
+        session.released = true;
+        if (session.timer) window.clearInterval(session.timer);
+        if (gatewaySession === session) gatewaySession = null;
+        gatewayRequest('DELETE', session.api, session.key);
+    }
+
+    function nativeGateway(url, original, gateway, request) {
+        if (!window.XMLHttpRequest) return false;
+        if (!credentials || credentials.gateway !== gateway) {
+            var key = window.prompt && window.prompt('Введите API-ключ медиашлюза Lampa Transcode');
+            if (!key) return false;
+            credentials = { gateway: gateway, key: key.trim() };
+        }
+        var auth = credentials;
+        var lampa = window.Lampa;
+        var api = gateway + 'api/v1/sessions';
+        var video = document.createElement('video');
+        var direct = video.canPlayType && video.canPlayType('video/mp4; codecs="avc1.640028, mp4a.40.2"');
+
+        function failed(session) {
+            releaseGateway(session);
+            if (request !== playbackRequest) return;
+            if (lampa.Noty && typeof lampa.Noty.show === 'function') {
+                lampa.Noty.show('Медиашлюз недоступен. Открываю исходное видео.');
+            }
+            fallback(original);
+        }
+
+        gatewayRequest('POST', api, auth.key, {
+            url: url, accepts_h264_aac_mp4: Boolean(direct), renewable_stream: true
+        }, function (status, result) {
+            if (status === 401 && credentials === auth) credentials = null;
+            if (status !== 201 || !result || !/^[a-f0-9]{32}$/.test(result.id)) {
+                failed();
+                return;
+            }
+            var session = { api: api + '/' + result.id, key: auth.key, original: original };
+            var prefix = '/stream/' + result.id + '/';
+            if (request !== playbackRequest) { releaseGateway(session); return; }
+            if (typeof result.stream_url !== 'string' || result.stream_url.indexOf(prefix) !== 0) {
+                failed(session);
+                return;
+            }
+            var stream = gateway + result.stream_url.slice(1);
+            function launch() {
+                if (request !== playbackRequest) { releaseGateway(session); return; }
+                var data = {};
+                Object.keys(original).forEach(function (field) { data[field] = original[field]; });
+                data.url = stream;
+                delete data.quality;
+                delete data.url_reserve;
+                delete data.ffprobe;
+                delete data.translate;
+                delete data.voiceovers;
+                data.error = function () { if (gatewaySession === session) failed(session); };
+                gatewaySession = session;
+                session.timer = window.setInterval(function () {
+                    gatewayRequest('PATCH', session.api, session.key);
+                }, 45000);
+                try { fallback(data); }
+                catch (error) { failed(session); }
+            }
+            if (result.mode === 'direct') launch();
+            else gatewayRequest('GET', stream, null, null, function (status) {
+                if (status === 200) launch();
+                else failed(session);
+            });
+        });
+        return true;
     }
 
     function openGateway(url, original, gateway) {
@@ -278,6 +376,12 @@
             param: { name: name + '_gateway', type: 'trigger', default: false },
             field: { name: 'Использовать сервер для HTTP-видео' }
         });
+        lampa.SettingsApi.addParam({
+            component: name,
+            param: { name: name + '_custom', type: 'trigger', default: false },
+            field: { name: 'Использовать экспериментальный плеер' }
+        });
+        lampa.Player.listener.follow('destroy', function () { releaseGateway(gatewaySession); });
         controller.add(name, {
             back: function () { close(true); },
             left: function () { jump(-10); },
@@ -288,7 +392,10 @@
             gone: function (next) { if (next !== name) close(false); }
         });
         lampa.Player.listener.follow('create', function (event) {
-            if (bypass || lampa.Storage.field(name + '_enabled') !== true || typeof event.abort !== 'function') return;
+            if (bypass) return;
+            var request = ++playbackRequest;
+            releaseGateway(gatewaySession);
+            if (lampa.Storage.field(name + '_enabled') !== true || typeof event.abort !== 'function') return;
             var url = source(event.data);
             if (!url) return;
             try {
@@ -299,10 +406,15 @@
                     url = lampa.Torserver.toPlayUrl(url);
                 }
                 var gateway = gatewayAddress();
-                if (gateway && lampa.Storage.field(name + '_gateway') === true && !/\.(m3u8|mpd)(?:[?#]|$)/i.test(url)) {
-                    openGateway(url, event.data, gateway);
-                } else open(url, event.data);
-                event.abort();
+                var useGateway = gateway && lampa.Storage.field(name + '_gateway') === true &&
+                    !/\.(m3u8|mpd)(?:[?#]|$)/i.test(url);
+                if (lampa.Storage.field(name + '_custom') === true) {
+                    if (useGateway) openGateway(url, event.data, gateway);
+                    else open(url, event.data);
+                    event.abort();
+                } else if (useGateway && nativeGateway(url, event.data, gateway, request)) {
+                    event.abort();
+                }
             } catch (error) {
                 close(true);
             }
