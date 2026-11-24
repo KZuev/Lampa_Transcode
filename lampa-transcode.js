@@ -108,14 +108,49 @@
         gatewayRequest('DELETE', session.api, session.key);
     }
 
+    function notify(message) {
+        var noty = window.Lampa.Noty;
+        if (noty && typeof noty.show === 'function') noty.show(message);
+    }
+
+    function gatewayCredentials(gateway) {
+        if (!credentials) {
+            try {
+                credentials = JSON.parse(window.localStorage.getItem(name + '_credentials'));
+            } catch (error) {}
+        }
+        if (credentials && credentials.gateway === gateway && typeof credentials.key === 'string' && credentials.key) {
+            return credentials;
+        }
+    }
+
+    function configureKey() {
+        var gateway = gatewayAddress();
+        if (!gateway) {
+            notify('Сначала укажите адрес медиашлюза.');
+            return;
+        }
+        var value = window.prompt('Введите API-ключ медиашлюза. Чтобы удалить ключ, оставьте поле пустым.', '');
+        if (value === null) return;
+        var key = value.trim();
+        credentials = key ? { gateway: gateway, key: key } : null;
+        var saved = false;
+        try {
+            if (credentials) window.localStorage.setItem(name + '_credentials', JSON.stringify(credentials));
+            else window.localStorage.removeItem(name + '_credentials');
+            saved = true;
+        } catch (error) {}
+        if (key) notify(saved ? 'API-ключ сохранён.' : 'API-ключ действует до закрытия Lampa.');
+        else notify('API-ключ удалён.');
+    }
+
     function nativeGateway(url, original, gateway, request) {
         if (!window.XMLHttpRequest) return false;
-        if (!credentials || credentials.gateway !== gateway) {
-            var key = window.prompt && window.prompt('Введите API-ключ медиашлюза Lampa Transcode');
-            if (!key) return false;
-            credentials = { gateway: gateway, key: key.trim() };
+        var auth = gatewayCredentials(gateway);
+        if (!auth) {
+            notify('Укажите API-ключ в настройках Lampa Transcode. Открываю исходное видео.');
+            return false;
         }
-        var auth = credentials;
         var lampa = window.Lampa;
         var api = gateway + 'api/v1/sessions';
         var video = document.createElement('video');
@@ -138,7 +173,6 @@
         gatewayRequest('POST', api, auth.key, {
             url: url, accepts_h264_aac_mp4: Boolean(direct), renewable_stream: true
         }, function (status, result) {
-            if (status === 401 && credentials === auth) credentials = null;
             if (status !== 201 || !result || !/^[a-f0-9]{32}$/.test(result.id)) {
                 failed(null, 'Создание сессии', status);
                 return;
@@ -375,6 +409,12 @@
             param: { name: name + '_gateway_url', type: 'input', values: '', default: '', placeholder: 'https://nas.example.org' },
             field: { name: 'Адрес медиашлюза' },
             onChange: function (value) { lampa.Storage.set(name + '_gateway_url', String(value || '').trim()); }
+        });
+        lampa.SettingsApi.addParam({
+            component: name,
+            param: { name: name + '_set_key', type: 'button' },
+            field: { name: 'API-ключ медиашлюза', description: 'Ввести, заменить или удалить ключ' },
+            onChange: configureKey
         });
         lampa.SettingsApi.addParam({
             component: name,
