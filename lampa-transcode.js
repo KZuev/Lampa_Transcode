@@ -124,7 +124,6 @@
         if (session.seekPoll) window.clearTimeout(session.seekPoll);
         if (session.seekNotice) hidePreparation(session.seekNotice);
         clearStartup(session);
-        clearPlaybackPrompt(session);
         if (gatewaySession === session) gatewaySession = null;
         gatewayRequest('DELETE', session.api, session.key);
     }
@@ -132,11 +131,6 @@
     function clearStartup(session) {
         if (session.startup) window.clearTimeout(session.startup);
         session.startup = null;
-    }
-
-    function clearPlaybackPrompt(session) {
-        if (session.playPrompt && session.playPrompt.parentNode) session.playPrompt.parentNode.removeChild(session.playPrompt);
-        session.playPrompt = null;
     }
 
     function armStartup(session) {
@@ -154,28 +148,17 @@
         session.playTried = true;
         var attempt;
         try { attempt = media.play(); }
-        catch (error) { return; }
+        catch (error) { session.playTried = false; return; }
         if (!attempt || typeof attempt.then !== 'function') return;
+        session.playAttempt = attempt;
         attempt.then(function () {
-            if (gatewaySession === session) clearStartup(session);
+            if (gatewaySession === session && session.playAttempt === attempt) clearStartup(session);
         }, function (error) {
-            if (gatewaySession !== session || !session.startup || !error || error.name !== 'NotAllowedError') return;
+            if (gatewaySession !== session || session.playAttempt !== attempt || !session.startup) return;
+            session.playTried = false;
+            if (!error || error.name !== 'NotAllowedError') return;
             clearStartup(session);
-            var button = document.createElement('button');
-            button.type = 'button';
-            button.textContent = '▶ Воспроизвести';
-            button.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
-                'z-index:2147483647;padding:.8em 1.2em;border:0;border-radius:.5em;background:#202024;color:#fff;' +
-                'font-size:1.4rem;font-weight:700;white-space:nowrap;cursor:pointer';
-            session.playPrompt = button;
-            button.onclick = function () {
-                clearPlaybackPrompt(session);
-                if (gatewaySession !== session) return;
-                armStartup(session);
-                session.playTried = false;
-                tryStockPlay(session, media);
-            };
-            document.body.appendChild(button);
+            notify('Браузер заблокировал автозапуск. Нажмите ▶ в плеере.');
         });
     }
 
@@ -211,6 +194,7 @@
             session.clockStart = session.hls && media && media.seekable && media.seekable.length ? media.seekable.start(0) : 0;
         }
         var current = Math.min(duration, session.offset + Math.max(0, event.current - session.clockStart));
+        session.current = current;
         if (session.hls) updateStockClock(lampa, current, duration);
         if (session.sample) session.sample(current, duration, event.current > session.clockStart && (!media || !media.paused));
     }
@@ -231,14 +215,16 @@
         var timeline = session.original.timeline;
         var series = seriesAudioKey(session.original);
         var hash = timeline && timeline.hash;
-        if ((!series && !hash) || !tracks || tracks.length < 2) return;
-        var key = name + '_audio_' + (series ? 'series_' + series : hash);
+        if (!tracks || tracks.length < 2) return;
+        var key = series || hash ? name + '_audio_' + (series ? 'series_' + series : hash) : null;
         var choice;
-        try { choice = JSON.parse(window.localStorage.getItem(key)); } catch (error) {}
+        try { if (key) choice = JSON.parse(window.localStorage.getItem(key)); } catch (error) {}
         var matches = [];
         Array.prototype.forEach.call(tracks, function (track, index) {
+            var label = String(track.label || track.name || '');
+            var ordinal = /^(\d+)\.\s*/.exec(label);
             var identity = {
-                label: String(track.label || track.name || '').replace(/^\d+\.\s*/, ''),
+                label: label.replace(/^\d+\.\s*/, ''),
                 language: String(track.language || track.lang || ''),
                 index: index
             };
@@ -246,7 +232,8 @@
             var previous = track.onSelect;
             if (previous && previous.transcodeAudioSession === session) return;
             var selected = function () {
-                try { window.localStorage.setItem(key, JSON.stringify(identity)); } catch (error) {}
+                try { if (key) window.localStorage.setItem(key, JSON.stringify(identity)); } catch (error) {}
+                if (session.switchAudio) session.switchAudio(ordinal ? Number(ordinal[1]) - 1 : index, tracks.length);
                 if (typeof previous === 'function') return previous.apply(this, arguments);
             };
             selected.transcodeAudioSession = session;
@@ -523,23 +510,27 @@
                 var playerVideo = lampa.PlayerVideo;
                 if (session.hls && session.duration > 0 && playerVideo &&
                     typeof playerVideo.url === 'function' && typeof playerVideo.destroy === 'function') {
-                    session.seek = function (fraction) {
-                        if (session.seekNotice || !isFinite(fraction)) return;
-                        var seconds = Math.max(0, Math.min(session.duration - 0.1, fraction * session.duration));
+                    function restartStream(position, audioIndex) {
+                        if (session.seekNotice || !isFinite(position)) return;
+                        var seconds = Math.max(0, Math.min(session.duration - 0.1, position));
+                        var audioSwitch = audioIndex !== undefined;
                         session.seekNotice = {};
                         showPreparation(session.seekNotice);
-                        session.seekNotice.notice.textContent = 'Перематываем видео…';
+                        session.seekNotice.notice.textContent = audioSwitch ? 'Переключаем аудиодорожку…' : 'Перематываем видео…';
                         clearStartup(session);
+                        session.playAttempt = null;
                         function alive() { return gatewaySession === session && !session.released; }
-                        gatewayRequest('POST', session.api + '/seek', session.key, { seconds: seconds }, function (status, shifted) {
+                        var payload = { seconds: seconds };
+                        if (audioSwitch) payload.audio_index = audioIndex;
+                        gatewayRequest('POST', session.api + (audioSwitch ? '/tracks' : '/seek'), session.key, payload, function (status, shifted) {
                             if (!alive()) return;
                             if (status !== 200 || !shifted || typeof shifted.stream_url !== 'string' || shifted.stream_url.indexOf(prefix) !== 0) {
-                                failed(session, 'Перемотка', status);
+                                failed(session, audioSwitch ? 'Переключение аудиодорожки' : 'Перемотка', status);
                                 return;
                             }
                             var mediaUrl = gateway + shifted.stream_url.slice(1);
                             waitForHls(mediaUrl, alive, function (timer) { session.seekPoll = timer; }, function (ready, errorStatus) {
-                                if (!ready) { failed(session, 'Загрузка после перемотки', errorStatus); return; }
+                                if (!ready) { failed(session, 'Загрузка нового потока', errorStatus); return; }
                                 var nextUrl = nativeSource(shifted, mediaUrl);
                                 if (data.playlist) data.playlist.forEach(function (item) {
                                     if (item && item.url === data.url) item.url = nextUrl;
@@ -547,15 +538,37 @@
                                 data.url = nextUrl;
                                 data.transcodeSource.stream = nextUrl;
                                 session.offset = Number(shifted.offset) || 0;
+                                session.current = session.offset;
                                 session.clockStart = undefined;
                                 session.audioRestored = session.playTried = session.expired = false;
-                                playerVideo.destroy(true);
-                                playerVideo.url(nextUrl, true);
+                                var media = typeof playerVideo.video === 'function' && playerVideo.video();
+                                if (data.hls_type === 'native' && media && typeof media.load === 'function' &&
+                                    typeof media.canPlayType === 'function' && media.canPlayType('application/vnd.apple.mpegurl')) {
+                                    // Safari grants autoplay per media element. Keep it across stream generations.
+                                    armStartup(session);
+                                    media.src = nextUrl;
+                                    media.load();
+                                } else {
+                                    playerVideo.destroy(true);
+                                    armStartup(session);
+                                    playerVideo.url(nextUrl, true);
+                                }
                                 hidePreparation(session.seekNotice);
                                 session.seekNotice = null;
                                 updateStockClock(lampa, session.offset, session.duration);
-                                armStartup(session);
                             });
+                        });
+                    }
+                    session.seek = function (fraction) { restartStream(fraction * session.duration); };
+                    session.switchAudio = function (ordinal, trackCount) {
+                        if (session.seekNotice || gatewaySession !== session || !session.stockReady) return;
+                        var selection = {};
+                        session.audioSelection = selection;
+                        gatewayRequest('GET', session.api + '/tracks', session.key, null, function (status, tracks) {
+                            if (gatewaySession !== session || session.audioSelection !== selection) return;
+                            var audio = status === 200 && tracks && Array.isArray(tracks.audio) && tracks.audio.slice(0, 8);
+                            if (!audio || audio.length !== trackCount || !audio[ordinal]) return;
+                            restartStream(session.current === undefined ? session.offset : session.current, audio[ordinal].index);
                         });
                     };
                 }
@@ -848,16 +861,15 @@
                 }
             });
             lampa.PlayerVideo.listener.follow('timeupdate', function (event) {
-                if (gatewaySession && event.current > 0 && (gatewaySession.startup || gatewaySession.playPrompt)) {
+                var media = typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
+                if (gatewaySession && event.current > 0 && gatewaySession.startup && (!media || !media.paused)) {
                     clearStartup(gatewaySession);
-                    clearPlaybackPrompt(gatewaySession);
                 }
                 if (gatewaySession && gatewaySession.stockReady && !gatewaySession.seekNotice) stockTimeUpdate(gatewaySession, lampa, event);
             });
             lampa.PlayerVideo.listener.follow('play', function () {
                 if (gatewaySession) {
                     clearStartup(gatewaySession);
-                    clearPlaybackPrompt(gatewaySession);
                 }
                 if (gatewaySession && gatewaySession.progress) gatewaySession.progress('playing');
             });
