@@ -10,6 +10,7 @@
     var gatewaySession;
     var pendingGateway;
     var playbackRequest = 0;
+    var plexSequence = { id: null, next: 0 };
     var credentials;
     var script = document.currentScript;
     var configuredGateway = window.LAMPA_TRANSCODE_CONFIG && window.LAMPA_TRANSCODE_CONFIG.gateway;
@@ -27,6 +28,7 @@
 
     function source(data) {
         if (!data || data.iptv || data.tv || data.vast_url || data.launch_player) return null;
+        if (data.transcodeSource && data.url === data.transcodeSource.stream) return data.transcodeSource.url;
         return typeof data.url === 'string' && /^https?:\/\//i.test(data.url) ? data.url : null;
     }
 
@@ -105,7 +107,9 @@
     function releaseGateway(session) {
         if (!session || session.released) return;
         session.released = true;
+        if (session.progress) session.progress('stopped');
         if (session.timer) window.clearInterval(session.timer);
+        if (session.reportTimer) window.clearInterval(session.reportTimer);
         if (session.startup) window.clearTimeout(session.startup);
         if (gatewaySession === session) gatewaySession = null;
         gatewayRequest('DELETE', session.api, session.key);
@@ -114,12 +118,63 @@
     function showPreparation(pending) {
         var status = document.createElement('div');
         status.setAttribute('role', 'status');
-        status.style.cssText = 'position:fixed;left:50%;bottom:12%;transform:translateX(-50%);' +
-            'max-width:85%;padding:.65em 1em;border-radius:.55em;background:#202024;color:#fff;' +
-            'z-index:2147483647;text-align:center;pointer-events:none';
+        status.style.cssText = 'position:fixed;top:0;right:0;bottom:0;left:0;display:flex;' +
+            'align-items:center;justify-content:center;box-sizing:border-box;padding:1.5rem;' +
+            'background:rgba(0,0,0,.72);color:#fff;font-size:1.5rem;font-size:clamp(1.5rem,4vw,2.25rem);' +
+            'font-weight:700;line-height:1.3;z-index:2147483647;text-align:center;pointer-events:none';
         status.textContent = 'Подготавливаем видео…';
         pending.notice = status;
         document.body.appendChild(status);
+    }
+
+    function trackPlayback(session, lampa) {
+        var original = session.original;
+        var timeline = original.timeline;
+        if (session.sample || !timeline || !timeline.hash || timeline.stop_recording) return;
+        var state, position, duration, start;
+        var video = lampa.PlayerVideo;
+        var plexId = original.plexPlaybackSession;
+
+        function report(next, heartbeat) {
+            if (state === 'stopped' || position === undefined || (!heartbeat && state === next)) return;
+            var changed = state !== next;
+            state = next;
+            if (changed && typeof lampa.Player.listener.send === 'function') {
+                lampa.Player.listener.send('native_playback', {
+                    hash: timeline.hash, state: state, percent: position / duration * 100,
+                    time: position, duration: duration,
+                    season: original.season || original.season_number,
+                    episode: original.episode || original.episode_number
+                });
+            }
+            if (typeof plexId === 'string' && plexId && typeof window.CustomEvent === 'function') {
+                if (plexSequence.id !== plexId) plexSequence = { id: plexId, next: 0 };
+                window.dispatchEvent(new window.CustomEvent('lampa:playback-state', { detail: {
+                    version: 1, sessionId: plexId, sequence: plexSequence.next++, hash: timeline.hash,
+                    state: state, time: position, duration: duration
+                } }));
+            }
+            saveTimeline(original, position, duration);
+        }
+
+        session.sample = function (event) {
+            var media = typeof video.video === 'function' && video.video();
+            var total = Number(session.hls ? session.duration : event.duration);
+            if (typeof event.current !== 'number' || !isFinite(event.current) ||
+                !isFinite(total) || total <= 0 || (media && media.seeking)) return;
+            if (start === undefined) {
+                start = session.hls && media && media.seekable && media.seekable.length ? media.seekable.start(0) : 0;
+            }
+            duration = total;
+            position = Math.min(total, session.offset + Math.max(0, event.current - start));
+            if (!state && event.current > start && (!media || !media.paused)) report('playing');
+        };
+        session.progress = function (next) {
+            if (state) report(next);
+        };
+        session.reportTimer = window.setInterval(function () {
+            if (state) report(state, true);
+        }, 10000);
     }
 
     function hidePreparation(pending) {
@@ -230,11 +285,9 @@
             pending.session = session;
             var prefix = '/stream/' + result.id + '/';
             if (request !== playbackRequest) { releaseGateway(session); return; }
-            if (typeof result.stream_url !== 'string' || result.stream_url.indexOf(prefix) !== 0) {
-                failed(session, 'Некорректный URL потока');
-                return;
-            }
-            var stream = gateway + result.stream_url.slice(1);
+            var stream;
+            var trackedHls = result.mode !== 'direct' && lampa.PlayerVideo && lampa.PlayerVideo.listener &&
+                original.timeline && original.timeline.hash && !original.timeline.stop_recording && result.duration > 0;
             function launch() {
                 if (request !== playbackRequest) { releaseGateway(session); return; }
                 pendingGateway = null;
@@ -248,12 +301,29 @@
                     data.hls_manifest_timeout = 30000;
                     if (window.location && window.location.protocol === 'lampaapp:') data.hls_type = 'native';
                 }
+                if (trackedHls) {
+                    // Stock timecodes for a rolling playlist use the playlist clock.
+                    data.launch_player = 'inner';
+                    data.timeline = {};
+                    Object.keys(original.timeline).forEach(function (field) { data.timeline[field] = original.timeline[field]; });
+                    data.timeline.stop_recording = true;
+                    data.timeline.percent = 0;
+                    data.timeline.time = 0;
+                    data.timeline.duration = 0;
+                }
+                data.transcodeSource = { url: url, stream: data.url };
                 if (Array.isArray(data.playlist)) {
                     data.playlist = data.playlist.map(function (entry) {
-                        if (!entry || (entry.url !== original.url && entry.url !== url)) return entry;
+                        if (!entry) return entry;
+                        var current = entry.url === original.url || entry.url === url;
+                        if (!current && !data.plexPlaybackSession) return entry;
                         var item = {};
                         Object.keys(entry).forEach(function (field) { item[field] = entry[field]; });
-                        item.url = data.url;
+                        if (data.plexPlaybackSession) item.plexPlaybackSession = data.plexPlaybackSession;
+                        if (current) {
+                            item.url = data.url;
+                            item.transcodeSource = data.transcodeSource;
+                        }
                         return item;
                     });
                 }
@@ -266,6 +336,10 @@
                 delete data.voiceovers;
                 data.error = function () { if (gatewaySession === session) failed(session, 'Штатный плеер'); };
                 session.playData = data;
+                session.hls = result.mode !== 'direct';
+                session.duration = result.duration;
+                session.offset = Number(result.offset) || 0;
+                session.trackPlayback = !session.hls || trackedHls;
                 gatewaySession = session;
                 session.timer = window.setInterval(function () {
                     gatewayRequest('PATCH', session.api, session.key);
@@ -273,14 +347,32 @@
                 try { fallback(data); }
                 catch (error) { failed(session, 'Запуск штатного плеера'); }
             }
-            if (result.mode === 'direct') launch();
-            else {
-                pending.notice.textContent = 'Подготавливаем поток для плеера…';
-                pending.xhr = gatewayRequest('GET', stream, null, null, function (status) {
-                    if (status === 200) launch();
-                    else failed(session, 'Загрузка HLS', status);
-                });
+            function prepare() {
+                if (typeof result.stream_url !== 'string' || result.stream_url.indexOf(prefix) !== 0) {
+                    failed(session, 'Некорректный URL потока');
+                    return;
+                }
+                stream = gateway + result.stream_url.slice(1);
+                if (result.mode === 'direct') launch();
+                else {
+                    pending.notice.textContent = 'Подготавливаем поток для плеера…';
+                    pending.xhr = gatewayRequest('GET', stream, null, null, function (status) {
+                        if (status === 200) launch();
+                        else failed(session, 'Загрузка HLS', status);
+                    });
+                }
             }
+            var resume = trackedHls ? savedPosition(original) : 0;
+            if (!(resume > 0 && resume < result.duration)) { prepare(); return; }
+            pending.xhr = gatewayRequest('POST', session.api + '/seek', session.key, { seconds: resume }, function (status, shifted) {
+                if (request !== playbackRequest) return;
+                if (status !== 200 || !shifted || shifted.id !== result.id) {
+                    failed(session, 'Продолжение просмотра', status);
+                    return;
+                }
+                result = shifted;
+                prepare();
+            });
         });
         return true;
     }
@@ -509,6 +601,7 @@
             lampa.Player.listener.follow('ready', function (data) {
                 var session = gatewaySession;
                 if (!session || session.playData !== data) return;
+                if (session.trackPlayback) trackPlayback(session, lampa);
                 session.startup = window.setTimeout(function () {
                     if (gatewaySession === session) data.error();
                 }, 35000);
@@ -518,6 +611,16 @@
                     window.clearTimeout(gatewaySession.startup);
                     gatewaySession.startup = null;
                 }
+                if (gatewaySession && gatewaySession.sample) gatewaySession.sample(event);
+            });
+            lampa.PlayerVideo.listener.follow('play', function () {
+                if (gatewaySession && gatewaySession.progress) gatewaySession.progress('playing');
+            });
+            lampa.PlayerVideo.listener.follow('pause', function () {
+                if (gatewaySession && gatewaySession.progress) gatewaySession.progress('paused');
+            });
+            lampa.PlayerVideo.listener.follow('destroy', function (event) {
+                if (!event.savemeta && gatewaySession && gatewaySession.progress) gatewaySession.progress('stopped');
             });
         }
         lampa.Player.listener.follow('destroy', function () { releaseGateway(gatewaySession); });
@@ -558,6 +661,9 @@
                 var request = ++playbackRequest;
                 cancelPendingGateway();
                 releaseGateway(gatewaySession);
+                if (event.data.transcodeSource && event.data.url === event.data.transcodeSource.stream) {
+                    event.data.url = event.data.transcodeSource.url;
+                }
                 if (custom) {
                     if (useGateway) openGateway(url, event.data, gateway);
                     else open(url, event.data);
