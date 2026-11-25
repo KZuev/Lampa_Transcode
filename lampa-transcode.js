@@ -454,16 +454,37 @@
             }
 
             function waitForHls(mediaUrl, alive, schedule, complete) {
-                var deadline = new Date().getTime() + 45000;
+                var started = Date.now();
+                var lastProgress = started;
+                var buffered = 0;
                 function read() {
                     if (!alive()) return;
                     return gatewayRequest('GET', mediaUrl, null, null, function (status, manifest) {
                         if (!alive()) return;
-                        var count = status === 200 && (String(manifest).match(/^#EXTINF:/gm) || []).length;
-                        if (count >= 3 || (count && /^#EXT-X-ENDLIST\s*$/m.test(manifest))) complete(true);
-                        else if ((status === 200 || status === 503) && new Date().getTime() < deadline) {
+                        var lengths = status === 200 ? String(manifest).match(/^#EXTINF:[0-9.]+/gm) || [] : [];
+                        var seconds = lengths.reduce(function (sum, entry) { return sum + Number(entry.slice(8)); }, 0);
+                        if (lengths.length >= 3 || (lengths.length >= 2 && seconds >= 12) ||
+                            (lengths.length && /^#EXT-X-ENDLIST\s*$/m.test(manifest))) {
+                            complete(true);
+                            return;
+                        }
+                        var now = Date.now();
+                        if (seconds > buffered) {
+                            buffered = seconds;
+                            lastProgress = now;
+                        }
+                        if ((status !== 200 && status !== 503) || now - started >= 120000) {
+                            complete(false, status);
+                        } else if (now - lastProgress < 45000) {
                             schedule(window.setTimeout(read, 1000));
-                        } else complete(false, status);
+                        } else {
+                            gatewayRequest('GET', session.api, session.key, null, function (healthStatus, info) {
+                                if (!alive()) return;
+                                if (healthStatus === 200 && info && info.state !== 'failed' && info.ffmpeg_speed > 0) {
+                                    schedule(window.setTimeout(read, 5000));
+                                } else complete(false, status);
+                            });
+                        }
                     });
                 }
                 return read();
@@ -639,7 +660,7 @@
                         return request === playbackRequest && pendingGateway === pending;
                     }, function (timer) { pending.poll = timer; }, function (ready, status) {
                         if (ready) launch();
-                        else failed(session, 'Загрузка HLS', status === 200 ? null : status,
+                        else failed(session, 'Загрузка HLS', status === 200 || status === 503 ? null : status,
                             'Не удалось собрать начальный буфер');
                     });
                 }
