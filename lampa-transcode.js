@@ -435,9 +435,23 @@
             fallback(original);
         }
 
-        pending.xhr = gatewayRequest('POST', api, auth.key, {
-            url: url, accepts_h264_aac_mp4: Boolean(direct), renewable_stream: true, native_audio: true
-        }, function (status, result) {
+        var input = { url: url, accepts_h264_aac_mp4: Boolean(direct), renewable_stream: true, native_audio: true };
+        if (nativeHls) {
+            input.prefer_compatible_hls = true;
+            if (video.canPlayType('video/mp4; codecs="hvc1.2.4.L153.B0"')) input.accepts_hevc_main10 = true;
+        }
+        function created(status, result) {
+            if (request !== playbackRequest && status !== 201) return;
+            if (status === 422 && input.prefer_compatible_hls && result && Array.isArray(result.detail) &&
+                result.detail.some(function (issue) {
+                    return issue.type === 'extra_forbidden' && Array.isArray(issue.loc) &&
+                        (issue.loc[1] === 'prefer_compatible_hls' || issue.loc[1] === 'accepts_hevc_main10');
+                })) {
+                delete input.prefer_compatible_hls;
+                delete input.accepts_hevc_main10;
+                pending.xhr = gatewayRequest('POST', api, auth.key, input, created);
+                return;
+            }
             if (status !== 201 || !result || !/^[a-f0-9]{32}$/.test(result.id)) {
                 failed(null, 'Создание сессии', status, result && result.detail);
                 return;
@@ -698,7 +712,8 @@
                 result = shifted;
                 prepare();
             });
-        });
+        }
+        pending.xhr = gatewayRequest('POST', api, auth.key, input, created);
         return true;
     }
 
