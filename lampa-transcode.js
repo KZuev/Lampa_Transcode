@@ -557,6 +557,11 @@
                     if (gatewaySession !== session || session.released || session.seekNotice) return;
                     var media = lampa.PlayerVideo && typeof lampa.PlayerVideo.video === 'function' && lampa.PlayerVideo.video();
                     var code = media && media.error && Number(media.error.code);
+                    if (!session.expired && (code === 3 || code === 4) && session.recover && !session.retriedDecoder) {
+                        session.retriedDecoder = true;
+                        session.recover();
+                        return;
+                    }
                     var reasons = { 1: 'Воспроизведение прервано', 2: 'Видео перестало загружаться',
                         3: 'Ошибка декодирования видео', 4: 'Формат потока не поддерживается' };
                     failed(session, 'Штатный плеер', null, session.expired ? 'Поток не начал воспроизводиться' : reasons[code]);
@@ -567,24 +572,27 @@
                 session.offset = Number(result.offset) || 0;
                 session.trackPlayback = !session.hls || trackedHls;
                 var playerVideo = lampa.PlayerVideo;
-                if (session.hls && session.duration > 0 && playerVideo &&
+                if (session.duration > 0 && playerVideo &&
                     typeof playerVideo.url === 'function' && typeof playerVideo.destroy === 'function') {
-                    function restartStream(position, audioIndex) {
+                    function restartStream(position, audioIndex, recover) {
                         if (session.seekNotice || !isFinite(position)) return;
                         var seconds = Math.max(0, Math.min(session.duration - 0.1, position));
                         var audioSwitch = audioIndex !== undefined;
                         session.seekNotice = {};
                         showPreparation(session.seekNotice);
-                        session.seekNotice.notice.textContent = audioSwitch ? 'Переключаем аудиодорожку…' : 'Перематываем видео…';
+                        var stage = recover ? 'Подготовка совместимого видео' : audioSwitch ? 'Переключение аудиодорожки' : 'Перемотка';
+                        session.seekNotice.notice.textContent = recover ? 'Готовим совместимое видео…' :
+                            audioSwitch ? 'Переключаем аудиодорожку…' : 'Перематываем видео…';
                         clearStartup(session);
                         session.playAttempt = null;
                         function alive() { return gatewaySession === session && !session.released; }
                         var payload = { seconds: seconds };
                         if (audioSwitch) payload.audio_index = audioIndex;
+                        if (recover) payload.force_compatibility = true;
                         gatewayRequest('POST', session.api + (audioSwitch ? '/tracks' : '/seek'), session.key, payload, function (status, shifted) {
                             if (!alive()) return;
                             if (status !== 200 || !shifted || typeof shifted.stream_url !== 'string' || shifted.stream_url.indexOf(prefix) !== 0) {
-                                failed(session, audioSwitch ? 'Переключение аудиодорожки' : 'Перемотка', status);
+                                failed(session, stage, status);
                                 return;
                             }
                             var mediaUrl = gateway + shifted.stream_url.slice(1);
@@ -596,6 +604,17 @@
                                 });
                                 data.url = nextUrl;
                                 data.transcodeSource.stream = nextUrl;
+                                if (recover && !session.hls) {
+                                    session.hls = true;
+                                    if (nativeHls || (window.location && window.location.protocol === 'lampaapp:')) data.hls_type = 'native';
+                                    data.hls_manifest_timeout = 30000;
+                                    if (data.timeline) {
+                                        var timeline = {};
+                                        Object.keys(data.timeline).forEach(function (field) { timeline[field] = data.timeline[field]; });
+                                        timeline.stop_recording = true;
+                                        data.timeline = timeline;
+                                    }
+                                }
                                 session.offset = Number(shifted.offset) || 0;
                                 session.current = session.offset;
                                 session.clockStart = undefined;
@@ -618,9 +637,12 @@
                             });
                         });
                     }
-                    session.seek = function (fraction) { restartStream(fraction * session.duration); };
+                    session.seek = function (fraction) { if (session.hls) restartStream(fraction * session.duration); };
+                    session.recover = function () {
+                        restartStream(session.current === undefined ? session.offset : session.current, undefined, true);
+                    };
                     session.switchAudio = function (ordinal, trackCount) {
-                        if (session.seekNotice || gatewaySession !== session || !session.stockReady) return;
+                        if (!session.hls || session.seekNotice || gatewaySession !== session || !session.stockReady) return;
                         var selection = {};
                         session.audioSelection = selection;
                         gatewayRequest('GET', session.api + '/tracks', session.key, null, function (status, tracks) {
